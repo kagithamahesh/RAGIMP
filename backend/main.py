@@ -1,131 +1,149 @@
-from fastapi import FastAPI,UploadFile,File
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
-from langchain_community.embeddings import HuggingFaceEmbeddings
-
-import os
-import shutil
-from transformers import pipeline
-from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import TextLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from groq import Groq
+import tempfile
+import shutil
+import os
 
+# =========================
+# FastAPI App
+# =========================
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials = True,
+    allow_origins=["*"],   # later replace with frontend URL
+    allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 
-#paths 
-UPLOAD_DIR = "uploads"
-VECTOR_DIR = "vectordb"
+# =========================
+# Global Variables
+# =========================
+DB_PATH = "vectordb"
+vector_db = None
 
-os.makedirs(UPLOAD_DIR,exist_ok=True)
-os.makedirs(VECTOR_DIR, exist_ok=True)
+# =========================
+# Groq Client
+# =========================
+client = Groq(
+    api_key=os.getenv("YOUR_REAL_KEY")
+)
 
-#Models
+# =========================
+# Embeddings Model
+# =========================
 embeddings = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
-llm = pipeline(
-    "text-generation",
-    model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-     max_new_tokens=220,
-    do_sample=True,
-    temperature=0.7
-)
+# =========================
+# Load Existing DB If Exists
+# =========================
+if os.path.exists(DB_PATH):
+    vector_db = Chroma(
+        persist_directory=DB_PATH,
+        embedding_function=embeddings
+    )
 
-#Load Or Create DB
+# =========================
+# Request Model
+# =========================
+class QuestionRequest(BaseModel):
+    question: str
 
-db = Chroma(
-    persist_directory=VECTOR_DIR,
-    embedding_function=embeddings
-)
-
-#Request Model
-class AskRequest(BaseModel):
-    question:str
-
-
-
-#helpers
-
-def load_document(file_path,ext):
-    if ext =="txt":
-        loader = TextLoader(file_path,encoding="utf-8")
-    else:
-        loader =PyPDFLoader(file_path)
-
-    docs =loader.load() 
-
-    return docs
-
-#Health check
-
+# =========================
+# Home Route
+# =========================
 @app.get("/")
 def home():
-    return {"message":"RAG Backend running"}
+    return {"message": "RAG Backend Running"}
 
+# =========================
+# Upload Multiple Files
+# =========================
 @app.post("/upload-multiple")
-async def upload_multiple(files:list[UploadFile]=File(...)):
+async def upload_multiple(files: list[UploadFile] = File(...)):
+    global vector_db
+
     all_docs = []
+
     for file in files:
-        save_path = os.path.join(UPLOAD_DIR,file.filename)
+        suffix = os.path.splitext(file.filename)[1]
 
-        with open(save_path,"wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            shutil.copyfileobj(file.file, tmp)
+            temp_path = tmp.name
 
-        ext = file.filename.split(".")[-1].lower()
-        docs =load_document(save_path,ext=ext)
+        # TXT Loader
+        if suffix == ".txt":
+            loader = TextLoader(temp_path, encoding="utf-8")
 
-        for d in docs:
-            d.metadata["source"] = file.filename
-        
+        # PDF Loader
+        elif suffix == ".pdf":
+            loader = PyPDFLoader(temp_path)
+
+        else:
+            continue
+
+        docs = loader.load()
         all_docs.extend(docs)
 
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size = 500,
-            chunk_overlap=50
-        )
+        os.remove(temp_path)
 
-        chunks = splitter.split_documents(all_docs)
-        if len(chunks) == 0:
-            return {"message": "No readable text found"}
-         
-         # recreate persistent db
-        global db
-        db= Chroma.from_documents(
-            documents=chunks,
-            embedding=embeddings,
-            persist_directory=VECTOR_DIR
-        )
+    # Split documents
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=50
+    )
 
-        return{
-            "message" :"files indexed successfully",
-            "files":len(files),
-            "chunks":len(chunks)
-        }
-    
-# ask qusation
+    chunks = splitter.split_documents(all_docs)
+
+    # Create vector DB
+    vector_db = Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        persist_directory=DB_PATH
+    )
+
+    vector_db.persist()
+
+    return {
+        "message": "Files indexed successfully",
+        "chunks": len(chunks)
+    }
+
+# =========================
+# Ask Question
+# =========================
 @app.post("/ask")
-async def ask(req: AskRequest):
+async def ask(data: QuestionRequest):
+    global vector_db
 
-    global db
+    if vector_db is None:
+        return {"answer": "Please upload files first.", "sources": []}
 
-    query = req.question
+    query = data.question
 
-    docs = db.similarity_search(query, k=3)
+    docs = vector_db.similarity_search(query, k=3)
 
-    context = "\n\n".join([d.page_content for d in docs])
+    context = "\n\n".join([doc.page_content for doc in docs])
+
+    sources = list(set([
+        doc.metadata.get("source", "Unknown")
+        for doc in docs
+    ]))
 
     prompt = f"""
-Use the context below to answer clearly.
+Answer only using the context below.
+If answer is not found, say:
+Not found in uploaded files.
 
 Context:
 {context}
@@ -136,77 +154,31 @@ Question:
 Answer:
 """
 
-    result = llm(prompt,
-                 max_new_tokens=120,
-                do_sample=True,
-                temperature=0.4,
-                return_full_text=False)
+    response = client.chat.completions.create(
+        model="llama3-8b-8192",
+        messages=[
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.3
+    )
 
-    answer = result[0]["generated_text"].strip()
-
-    # citations
-    sources = []
-
-    for d in docs:
-        src = d.metadata.get("source", "Unknown")
-        if src not in sources:
-            sources.append(src)
+    answer = response.choices[0].message.content
 
     return {
         "answer": answer,
         "sources": sources
     }
 
-# @app.post("/ask") 
-# async def ask(req:AskRequest):
-#     global db
-#     query = req.question
-#     docs = db.similarity_search(query,k=3)
-
-#     context = "\n\n".join([d.page_content for d in docs])
-
-#     prompt = f"""
-# Use the content below to answer clearly.
-
-# Context:
-# {context}
-
-# Question:
-# {query}
-
-# Answer:
-# """
-#     result = llm(prompt)
-#     answer = result[0]["generated_text"]
-
-#     #citations
-#     sources = []
-
-#     for d in docs:
-#             src = d.metadata.get("source","Unknown")
-
-#             if src not in sources:
-#                 sources.append(src)
-
-#             return{
-#                     "answer": answer,
-#                 "sources": sources
-#             }     
-        
-#  #clear DB
-
+# =========================
+# Clear DB
+# =========================
 @app.delete("/clear")
 def clear_db():
-    global db
+    global vector_db
 
-    if os.path.exists(VECTOR_DIR):
-        shutil.rmtree(VECTOR_DIR)
+    vector_db = None
 
-    os.makedirs(VECTOR_DIR,exist_ok=True)
-
-    db = Chroma(
-        persist_directory=VECTOR_DIR,
-        embedding_function=embeddings
-    )      
+    if os.path.exists(DB_PATH):
+        shutil.rmtree(DB_PATH)
 
     return {"message": "Knowledge base cleared"}

@@ -1,0 +1,3 @@
+RAG stands for Retrieval Augmented Generation.
+It helps language models answer using external documents.
+Streamlit is used for building Python web apps.

@@ -138,9 +138,9 @@ Answer:
 
     result = llm(prompt,
                  max_new_tokens=120,
-    do_sample=True,
-    temperature=0.4,
-    return_full_text=False)
+                do_sample=True,
+                temperature=0.4,
+                return_full_text=False)
 
     answer = result[0]["generated_text"].strip()
 
